@@ -1,6 +1,6 @@
 from fastapi import FastAPI, Depends, HTTPException
 from pydantic import BaseModel
-from sqlalchemy import create_engine, Column, Integer, Float, String, DateTime, ForeignKey
+from sqlalchemy import select, create_engine, Column, Integer, Float, String, DateTime, ForeignKey
 from sqlalchemy.orm import declarative_base, sessionmaker, Session
 from datetime import datetime
 from typing import List, Optional
@@ -321,6 +321,11 @@ def haversine(lat1, lon1, lat2, lon2):
 
     a = math.sin(dphi/2)**2 + math.cos(phi1)*math.cos(phi2)*math.sin(dlambda/2)**2
     return 2 * R * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+
+@app.get("/devices")
+def get_devices(db: Session = Depends(get_db)):
+    stmt = select(Location.device_id).distinct()
+    return db.execute(stmt).scalars().all()
 
 # ========================
 # REPORT
