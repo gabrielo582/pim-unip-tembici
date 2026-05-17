@@ -1,4 +1,5 @@
 from fastapi import FastAPI, Depends, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from sqlalchemy import select, create_engine, Column, Integer, Float, String, DateTime, ForeignKey
 from sqlalchemy.orm import declarative_base, sessionmaker, Session
@@ -8,6 +9,14 @@ import math
 from collections import defaultdict
 
 app = FastAPI()
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 # SQLite fix para FastAPI
 engine = create_engine(
@@ -40,7 +49,7 @@ class Bike(Base):
     __tablename__ = "bikes"
 
     id = Column(Integer, primary_key=True, index=True)
-    title = Column(String)
+    title = Column(String, index=True, unique=True)
 
 class BikeComponent(Base):
     __tablename__ = "bike_components"
@@ -81,7 +90,7 @@ class BikeResponse(BikeRequest):
     id: int
 
     class Config:
-        orm_mode = True
+        from_attributes = True
 
 class BikeComponentRequest(BaseModel):
     title: str
@@ -90,7 +99,7 @@ class BikeComponentResponse(BikeComponentRequest):
     id: int
 
     class Config:
-        orm_mode = True
+        from_attributes = True
 
 class BikeMaintenanceRequest(BaseModel):
     bike_id: int
@@ -103,7 +112,7 @@ class BikeMaintenanceResponse(BikeMaintenanceRequest):
     id: int
 
     class Config:
-        orm_mode = True
+        from_attributes = True
 
 # ========================
 # DEPENDENCY (boa prática)
@@ -121,6 +130,12 @@ def get_db():
 
 @app.post("/location")
 def receive_location(data: LocationRequest, db: Session = Depends(get_db)):
+    lastLocation = db.query(Location).filter_by(device_id=data.device_id).order_by(Location.id.desc()).first()
+    if lastLocation:
+        dist = haversine(lastLocation.latitude, lastLocation.longitude, data.latitude, data.longitude)
+        if dist < 5:  # filtro simples para evitar pontos muito próximos
+            return {"status": "ignored", "reason": "too close to last point"}
+
     loc = Location(
         device_id=data.device_id,
         bike_id=data.bike_id,
