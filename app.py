@@ -1,7 +1,7 @@
 from fastapi import FastAPI, Depends, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from sqlalchemy import select, create_engine, Column, Integer, Float, String, DateTime, ForeignKey
+from sqlalchemy import select, create_engine, Column, Integer, Float, String, DateTime, ForeignKey, inspect, text
 from sqlalchemy.orm import declarative_base, sessionmaker, Session
 from datetime import datetime
 from typing import List, Optional
@@ -66,8 +66,17 @@ class BikeMaintenance(Base):
     maintenance_type = Column(Integer)
     maintenance_cost = Column(Float)
     maintenance_start_date = Column(DateTime, default=datetime.utcnow)
+    life_effort = Column(Float, default=0.0)
 
 Base.metadata.create_all(engine)
+
+# Adiciona coluna de vida útil de esforço caso o banco já exista sem essa coluna.
+inspector = inspect(engine)
+if "bike_maintenance" in inspector.get_table_names():
+    columns = [col["name"] for col in inspector.get_columns("bike_maintenance")]
+    if "life_effort" not in columns:
+        with engine.connect() as conn:
+            conn.execute(text("ALTER TABLE bike_maintenance ADD COLUMN life_effort FLOAT DEFAULT 0.0"))
 
 # ========================
 # SCHEMA
@@ -110,6 +119,7 @@ class BikeMaintenanceRequest(BaseModel):
 
 class BikeMaintenanceResponse(BikeMaintenanceRequest):
     id: int
+    life_effort: float = 0.0
 
     class Config:
         from_attributes = True
@@ -136,9 +146,13 @@ def receive_location(data: LocationRequest, db: Session = Depends(get_db)):
         if dist < 5:  # filtro simples para evitar pontos muito próximos
             return {"status": "ignored", "reason": "too close to last point"}
 
+    bike_id = data.bike_id
+    if bike_id is None and lastLocation is not None:
+        bike_id = lastLocation.bike_id
+
     loc = Location(
         device_id=data.device_id,
-        bike_id=data.bike_id,
+        bike_id=bike_id,
         latitude=data.latitude,
         longitude=data.longitude,
         accuracy=data.accuracy,
@@ -263,12 +277,21 @@ def create_maintenance(data: BikeMaintenanceRequest, db: Session = Depends(get_d
     if not db.query(BikeComponent).get(data.bike_component_id):
         raise HTTPException(status_code=404, detail="Component not found")
 
+    maintenance_start_date = data.maintenance_start_date or datetime.utcnow()
+    life_effort = calculate_maintenance_life_effort(
+        data.bike_id,
+        data.bike_component_id,
+        maintenance_start_date,
+        db
+    )
+
     maintenance = BikeMaintenance(
         bike_id=data.bike_id,
         bike_component_id=data.bike_component_id,
         maintenance_type=data.maintenance_type,
         maintenance_cost=data.maintenance_cost,
-        maintenance_start_date=data.maintenance_start_date or datetime.utcnow()
+        maintenance_start_date=maintenance_start_date,
+        life_effort=life_effort
     )
 
     db.add(maintenance)
@@ -308,6 +331,13 @@ def update_maintenance(maintenance_id: int, data: BikeMaintenanceRequest, db: Se
     maintenance.maintenance_type = data.maintenance_type
     maintenance.maintenance_cost = data.maintenance_cost
     maintenance.maintenance_start_date = data.maintenance_start_date or maintenance.maintenance_start_date
+    maintenance.life_effort = calculate_maintenance_life_effort(
+        data.bike_id,
+        data.bike_component_id,
+        maintenance.maintenance_start_date,
+        db,
+        exclude_maintenance_id=maintenance_id
+    )
     db.commit()
     db.refresh(maintenance)
     return maintenance
@@ -342,13 +372,134 @@ def get_devices(db: Session = Depends(get_db)):
     stmt = select(Location.device_id).distinct()
     return db.execute(stmt).scalars().all()
 
+
+def compute_effort_between(bike_id: int, since: Optional[datetime], until: Optional[datetime], db: Session):
+    query = db.query(Location).filter_by(bike_id=bike_id)
+    if since is not None:
+        query = query.filter(Location.created_at >= since)
+    if until is not None:
+        query = query.filter(Location.created_at <= until)
+    locations = query.order_by(Location.created_at.asc()).all()
+
+    total_effort = 0.0
+    for i in range(1, len(locations)):
+        p1 = locations[i - 1]
+        p2 = locations[i]
+
+        dist = haversine(p1.latitude, p1.longitude, p2.latitude, p2.longitude)
+        dt = (p2.created_at - p1.created_at).total_seconds()
+        if dt <= 0:
+            continue
+
+        speed = dist / dt
+        alt_diff = (p2.altitude or 0) - (p1.altitude or 0)
+        alt_gain = max(0, alt_diff)
+        effort = dist * (1 + alt_gain * 0.01) * (1 + speed * 0.05)
+        total_effort += effort
+
+    return total_effort
+
+
+def calculate_maintenance_life_effort(
+    bike_id: int,
+    component_id: int,
+    maintenance_date: datetime,
+    db: Session,
+    exclude_maintenance_id: Optional[int] = None
+):
+    query = db.query(BikeMaintenance).filter_by(bike_id=bike_id, bike_component_id=component_id)
+    if exclude_maintenance_id is not None:
+        query = query.filter(BikeMaintenance.id != exclude_maintenance_id)
+
+    last_maintenance = query.order_by(BikeMaintenance.maintenance_start_date.desc()).first()
+    since_date = last_maintenance.maintenance_start_date if last_maintenance else None
+    return compute_effort_between(bike_id, since_date, maintenance_date, db)
+
+
+def get_alert_for_usage(used_effort: float, life_effort: float):
+    if life_effort <= 0:
+        return {
+            "status": "unknown",
+            "alert": "Sem configuração",
+            "message": "A vida útil estimada do componente não foi configurada.",
+            "usage_percent": None
+        }
+
+    usage_percent = round((used_effort / life_effort) * 100, 2)
+    if usage_percent < 70:
+        alert = "Verde"
+        status = "observation"
+        message = "Componente com menos de 70% da vida útil utilizada."
+    elif usage_percent <= 90:
+        alert = "Amarelo"
+        status = "attention"
+        message = "Componente entre 70% e 90% da vida útil. Agende inspeção em breve."
+    else:
+        alert = "Vermelho"
+        status = "critical"
+        message = "Componente com mais de 90% da vida útil. Ordem de serviço imediata recomendada."
+
+    return {
+        "status": status,
+        "alert": alert,
+        "message": message,
+        "usage_percent": min(100.0, usage_percent)
+    }
+
+
+@app.get("/predictive-report/{bike_id}")
+def get_predictive_report(bike_id: int, db: Session = Depends(get_db)):
+    bike = db.query(Bike).get(bike_id)
+    if not bike:
+        raise HTTPException(status_code=404, detail="Bike not found")
+
+    components = db.query(BikeComponent).all()
+    if not components:
+        return {
+            "bike_id": bike_id,
+            "components": [],
+            "message": "Nenhum componente cadastrado para análise preditiva."
+        }
+
+    report = []
+    for component in components:
+        last_maintenance = (
+            db.query(BikeMaintenance)
+            .filter_by(bike_id=bike_id, bike_component_id=component.id)
+            .order_by(BikeMaintenance.maintenance_start_date.desc())
+            .first()
+        )
+
+        since_date = last_maintenance.maintenance_start_date if last_maintenance else None
+        used_effort = compute_effort_between(bike_id, since_date, None, db)
+        life_effort = last_maintenance.life_effort if last_maintenance else 0.0
+        alert_data = get_alert_for_usage(used_effort, life_effort)
+
+        report.append({
+            "component_id": component.id,
+            "component_title": component.title,
+            "last_maintenance_date": last_maintenance.maintenance_start_date if last_maintenance else None,
+            "last_maintenance_life_effort": round(life_effort, 2),
+            "effort_since_last_maintenance": round(used_effort, 2),
+            "alert": alert_data["alert"],
+            "status": alert_data["status"],
+            "usage_percent": alert_data["usage_percent"],
+            "message": alert_data["message"]
+        })
+
+    return {
+        "bike_id": bike_id,
+        "components": report
+    }
+
+
 # ========================
 # REPORT
 # ========================
-@app.get("/device-report/{device_id}")
-def get_report(device_id: str, db: Session = Depends(get_db)):
+@app.get("/bike-report/{bike_id}")
+def get_report(bike_id: int, db: Session = Depends(get_db)):
     locations = db.query(Location)\
-        .filter_by(device_id=device_id)\
+        .filter_by(bike_id=bike_id)\
         .order_by(Location.created_at.asc())\
         .all()
 
@@ -415,7 +566,7 @@ def get_report(device_id: str, db: Session = Depends(get_db)):
     avg_speed_total = total_distance / total_time if total_time > 0 else 0
 
     return {
-        "device_id": device_id,
+        "bike_id": bike_id,
         "summary": {
             "total_distance_m": round(total_distance, 2),
             "avg_speed_m_s": round(avg_speed_total, 2),
