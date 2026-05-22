@@ -1,0 +1,406 @@
+diff --git a/.vscode/settings.json b/.vscode/settings.json
+index 34b9cd7..742e9a6 100644
+--- a/.vscode/settings.json
++++ b/.vscode/settings.json
+@@ -2,5 +2,13 @@
+     "files.associations": {
+         "*.dbclient-js": "javascript",
+         "plyconfig.json": "jsonc"
+-    }
++    },
++    "sqltools.connections": [
++        {
++            "previewLimit": 50,
++            "driver": "SQLite",
++            "database": "${workspaceFolder:api}/tracker.db",
++            "name": "tembici"
++        }
++    ]
+ }
+\ No newline at end of file
+diff --git a/README.md b/README.md
+index 3ee6471..da03032 100644
+--- a/README.md
++++ b/README.md
+@@ -1,7 +1,15 @@
+ RUN
++```javascript
++python3 -m venv ./.venv
+ ```
+-source .venv/bin/activate
++```javascript
++pip install -r requirements.txt
+ ```
++```javascript
++source .venv/bin/activate
+ ```
++```javascript
+ uvicorn app:app --host 0.0.0.0 --port 8000
+-```
+\ No newline at end of file
++```
++
++ 
+\ No newline at end of file
+diff --git a/app.py b/app.py
+index 46cb415..a3f694a 100644
+--- a/app.py
++++ b/app.py
+@@ -1,7 +1,7 @@
+ from fastapi import FastAPI, Depends, HTTPException
+ from fastapi.middleware.cors import CORSMiddleware
+ from pydantic import BaseModel
+-from sqlalchemy import select, create_engine, Column, Integer, Float, String, DateTime, ForeignKey, inspect, text
++from sqlalchemy import select, create_engine, Column, Integer, Float, String, DateTime, ForeignKey, inspect, text, func
+ from sqlalchemy.orm import declarative_base, sessionmaker, Session
+ from datetime import datetime
+ from typing import List, Optional
+@@ -110,6 +110,9 @@ class BikeComponentResponse(BikeComponentRequest):
+     class Config:
+         from_attributes = True
+ 
++class BikeComponentReadResponse(BikeComponentResponse):
++    average_component_life_effort: float = 0.0
++
+ class BikeMaintenanceRequest(BaseModel):
+     bike_id: int
+     bike_component_id: int
+@@ -236,17 +239,31 @@ def create_component(data: BikeComponentRequest, db: Session = Depends(get_db)):
+     return component
+ 
+ 
+-@app.get("/components", response_model=List[BikeComponentResponse])
++@app.get("/components", response_model=List[BikeComponentReadResponse])
+ def list_components(db: Session = Depends(get_db)):
+-    return db.query(BikeComponent).all()
++    components = db.query(BikeComponent).all()
++    averages = get_component_life_effort_averages(db)
++
++    return [
++        {
++            "id": component.id,
++            "title": component.title,
++            "average_component_life_effort": round(averages.get(component.id, 0.0), 2)
++        }
++        for component in components
++    ]
+ 
+ 
+-@app.get("/components/{component_id}", response_model=BikeComponentResponse)
++@app.get("/components/{component_id}", response_model=BikeComponentReadResponse)
+ def get_component(component_id: int, db: Session = Depends(get_db)):
+     component = db.query(BikeComponent).get(component_id)
+     if not component:
+         raise HTTPException(status_code=404, detail="Component not found")
+-    return component
++    return {
++        "id": component.id,
++        "title": component.title,
++        "average_component_life_effort": round(get_average_component_life_effort(component.id, db), 2)
++    }
+ 
+ 
+ @app.put("/components/{component_id}", response_model=BikeComponentResponse)
+@@ -367,14 +384,47 @@ def haversine(lat1, lon1, lat2, lon2):
+     a = math.sin(dphi/2)**2 + math.cos(phi1)*math.cos(phi2)*math.sin(dlambda/2)**2
+     return 2 * R * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+ 
++
++def segment_trips(locations, min_time_gap_seconds=60):
++    """
++    Segmenta uma lista de localizações em viagens separadas.
++    Se o intervalo entre dois pontos for > min_time_gap_seconds, considera como viagens diferentes.
++    Retorna uma lista de listas, onde cada sublista é uma viagem contínua.
++    """
++    if not locations:
++        return []
++    
++    trips = []
++    current_trip = [locations[0]]
++    
++    for i in range(1, len(locations)):
++        prev_location = locations[i - 1]
++        curr_location = locations[i]
++        
++        time_gap = (curr_location.created_at - prev_location.created_at).total_seconds()
++        
++        if time_gap > min_time_gap_seconds:
++            # Nova viagem
++            trips.append(current_trip)
++            current_trip = [curr_location]
++        else:
++            # Continua a viagem
++            current_trip.append(curr_location)
++    
++    # Adiciona a última viagem
++    if current_trip:
++        trips.append(current_trip)
++    
++    return trips
++
+ @app.get("/devices")
+ def get_devices(db: Session = Depends(get_db)):
+     stmt = select(Location.device_id).distinct()
+     return db.execute(stmt).scalars().all()
+ 
+ 
+-def compute_effort_between(bike_id: int, since: Optional[datetime], until: Optional[datetime], db: Session):
+-    query = db.query(Location).filter_by(bike_id=bike_id)
++def compute_effort_between(bike: int, since: Optional[datetime], until: Optional[datetime], db: Session):
++    query = db.query(Location).filter_by(bike_id=bike)
+     if since is not None:
+         query = query.filter(Location.created_at >= since)
+     if until is not None:
+@@ -382,22 +432,56 @@ def compute_effort_between(bike_id: int, since: Optional[datetime], until: Optio
+     locations = query.order_by(Location.created_at.asc()).all()
+ 
+     total_effort = 0.0
+-    for i in range(1, len(locations)):
+-        p1 = locations[i - 1]
+-        p2 = locations[i]
++    trips = segment_trips(locations, min_time_gap_seconds=60)
++    
++    # Calcula esforço para cada viagem separadamente
++    for trip in trips:
++        for i in range(1, len(trip)):
++            p1 = trip[i - 1]
++            p2 = trip[i]
++
++            dist = haversine(p1.latitude, p1.longitude, p2.latitude, p2.longitude)
++            dt = (p2.created_at - p1.created_at).total_seconds()
++            if dt <= 0:
++                continue
++
++            speed = dist / dt
++            alt_diff = (p2.altitude or 0) - (p1.altitude or 0)
++            alt_gain = max(0, alt_diff)
++            effort = dist * (1 + alt_gain * 0.01) * (1 + speed * 0.05)
++            total_effort += effort
+ 
+-        dist = haversine(p1.latitude, p1.longitude, p2.latitude, p2.longitude)
+-        dt = (p2.created_at - p1.created_at).total_seconds()
+-        if dt <= 0:
+-            continue
++    return total_effort
+ 
+-        speed = dist / dt
+-        alt_diff = (p2.altitude or 0) - (p1.altitude or 0)
+-        alt_gain = max(0, alt_diff)
+-        effort = dist * (1 + alt_gain * 0.01) * (1 + speed * 0.05)
+-        total_effort += effort
+ 
+-    return total_effort
++def get_average_component_life_effort(component_id: int, db: Session):
++    """
++    Calcula a MÉDIA de vida útil de um componente considerando TODAS as bicicletas.
++    Busca todas as manutenções desse componente em todas as bikes e retorna a média do life_effort.
++    """
++    average_life_effort = (
++        db.query(func.avg(BikeMaintenance.life_effort))
++        .filter(BikeMaintenance.bike_component_id == component_id)
++        .scalar()
++    )
++
++    return average_life_effort or 0.0
++
++
++def get_component_life_effort_averages(db: Session):
++    averages = (
++        db.query(
++            BikeMaintenance.bike_component_id,
++            func.avg(BikeMaintenance.life_effort).label("average_life_effort")
++        )
++        .group_by(BikeMaintenance.bike_component_id)
++        .all()
++    )
++
++    return {
++        component_id: average_life_effort or 0.0
++        for component_id, average_life_effort in averages
++    }
+ 
+ 
+ def calculate_maintenance_life_effort(
+@@ -407,12 +491,26 @@ def calculate_maintenance_life_effort(
+     db: Session,
+     exclude_maintenance_id: Optional[int] = None
+ ):
+-    query = db.query(BikeMaintenance).filter_by(bike_id=bike_id, bike_component_id=component_id)
++    """
++    Calcula o esforço acumulado da bike para esse componente
++    desde a última manutenção até a data da manutenção atual.
++    """
++    query = db.query(BikeMaintenance).filter(
++        BikeMaintenance.bike_id == bike_id,
++        BikeMaintenance.bike_component_id == component_id,
++        BikeMaintenance.maintenance_start_date < maintenance_date
++    )
++
+     if exclude_maintenance_id is not None:
+         query = query.filter(BikeMaintenance.id != exclude_maintenance_id)
+ 
+-    last_maintenance = query.order_by(BikeMaintenance.maintenance_start_date.desc()).first()
++    last_maintenance = (
++        query
++        .order_by(BikeMaintenance.maintenance_start_date.desc(), BikeMaintenance.id.desc())
++        .first()
++    )
+     since_date = last_maintenance.maintenance_start_date if last_maintenance else None
++
+     return compute_effort_between(bike_id, since_date, maintenance_date, db)
+ 
+ 
+@@ -472,14 +570,15 @@ def get_predictive_report(bike_id: int, db: Session = Depends(get_db)):
+ 
+         since_date = last_maintenance.maintenance_start_date if last_maintenance else None
+         used_effort = compute_effort_between(bike_id, since_date, None, db)
+-        life_effort = last_maintenance.life_effort if last_maintenance else 0.0
+-        alert_data = get_alert_for_usage(used_effort, life_effort)
++        # Usa a MÉDIA de vida útil do componente entre TODAS as bikes
++        average_life_effort = get_average_component_life_effort(component.id, db)
++        alert_data = get_alert_for_usage(used_effort, average_life_effort)
+ 
+         report.append({
+             "component_id": component.id,
+             "component_title": component.title,
+             "last_maintenance_date": last_maintenance.maintenance_start_date if last_maintenance else None,
+-            "last_maintenance_life_effort": round(life_effort, 2),
++            "average_component_life_effort": round(average_life_effort, 2),
+             "effort_since_last_maintenance": round(used_effort, 2),
+             "alert": alert_data["alert"],
+             "status": alert_data["status"],
+@@ -496,10 +595,10 @@ def get_predictive_report(bike_id: int, db: Session = Depends(get_db)):
+ # ========================
+ # REPORT
+ # ========================
+-@app.get("/bike-report/{bike_id}")
+-def get_report(bike_id: int, db: Session = Depends(get_db)):
++@app.get("/bike-report/{bike}")
++def get_report(bike: int, db: Session = Depends(get_db)):
+     locations = db.query(Location)\
+-        .filter_by(bike_id=bike_id)\
++        .filter_by(bike_id=bike)\
+         .order_by(Location.created_at.asc())\
+         .all()
+ 
+@@ -515,38 +614,42 @@ def get_report(bike_id: int, db: Session = Depends(get_db)):
+ 
+     total_distance = 0
+     total_effort = 0
++    
++    # Segmenta as localizações em viagens separadas
++    trips = segment_trips(locations, min_time_gap_seconds=60)
+ 
+-    for i in range(1, len(locations)):
+-        p1 = locations[i - 1]
+-        p2 = locations[i]
++    for trip in trips:
++        for i in range(1, len(trip)):
++            p1 = trip[i - 1]
++            p2 = trip[i]
+ 
+-        # Distância
+-        dist = haversine(p1.latitude, p1.longitude, p2.latitude, p2.longitude)
++            # Distância
++            dist = haversine(p1.latitude, p1.longitude, p2.latitude, p2.longitude)
+ 
+-        # Tempo (segundos)
+-        dt = (p2.created_at - p1.created_at).total_seconds()
+-        if dt <= 0:
+-            continue
++            # Tempo (segundos)
++            dt = (p2.created_at - p1.created_at).total_seconds()
++            if dt <= 0:
++                continue
+ 
+-        # Velocidade média (m/s)
+-        speed = dist / dt
++            # Velocidade média (m/s)
++            speed = dist / dt
+ 
+-        # Ganho de altitude (só subida)
+-        alt_diff = (p2.altitude or 0) - (p1.altitude or 0)
+-        alt_gain = max(0, alt_diff)
++            # Ganho de altitude (só subida)
++            alt_diff = (p2.altitude or 0) - (p1.altitude or 0)
++            alt_gain = max(0, alt_diff)
+ 
+-        # Esforço (modelo simples)
+-        effort = dist * (1 + alt_gain * 0.01) * (1 + speed * 0.05)
++            # Esforço (modelo simples)
++            effort = dist * (1 + alt_gain * 0.01) * (1 + speed * 0.05)
+ 
+-        day = p2.created_at.date().isoformat()
++            day = p2.created_at.date().isoformat()
+ 
+-        daily[day]["distance"] += dist
+-        daily[day]["time"] += dt
+-        daily[day]["alt_gain"] += alt_gain
+-        daily[day]["effort"] += effort
++            daily[day]["distance"] += dist
++            daily[day]["time"] += dt
++            daily[day]["alt_gain"] += alt_gain
++            daily[day]["effort"] += effort
+ 
+-        total_distance += dist
+-        total_effort += effort
++            total_distance += dist
++            total_effort += effort
+ 
+     # Monta resposta
+     history = []
+@@ -566,11 +669,11 @@ def get_report(bike_id: int, db: Session = Depends(get_db)):
+     avg_speed_total = total_distance / total_time if total_time > 0 else 0
+ 
+     return {
+-        "bike_id": bike_id,
++        "bike_id": bike,
+         "summary": {
+             "total_distance_m": round(total_distance, 2),
+             "avg_speed_m_s": round(avg_speed_total, 2),
+             "total_effort": round(total_effort, 2)
+         },
+         "daily_history": history
+-    }
+\ No newline at end of file
++    }
+diff --git a/requirements.txt b/requirements.txt
+index 0a4249c..2b9b8e5 100644
+--- a/requirements.txt
++++ b/requirements.txt
+@@ -2,3 +2,4 @@ fastapi
+ uvicorn
+ sqlalchemy
+ pydantic
++requests
+\ No newline at end of file
+diff --git a/script.py b/script.py
+deleted file mode 100644
+index 95e7cdc..0000000
+--- a/script.py
++++ /dev/null
+@@ -1,23 +0,0 @@
+-import requests
+-
+-api_url = "https://tembici.oliveirasousa.top/components"
+-
+-componentes = [
+-    "Quadro", "Garfo / Suspensão", "Guidão", "Mesa / Avanço", 
+-    "Selim", "Canote", "Roda Dianteira", "Roda Traseira", 
+-    "Pneu Dianteiro", "Pneu Traseiro", "Pedais", "Pedivela", 
+-    "Corrente", "Cassete / Catraca", "Câmbio Traseiro", 
+-    "Câmbio Dianteiro", "Trocadores de Marcha", "Freio Dianteiro", 
+-    "Freio Traseiro", "Movimento Central", "Caixa de Direção"
+-]
+-
+-print("Iniciando cadastro de componentes...")
+-
+-for comp in componentes:
+-    resposta = requests.post(api_url, json={"title": comp})
+-    if resposta.status_code == 200:
+-        print(f"✅ '{comp}' cadastrado com sucesso!")
+-    else:
+-        print(f"❌ Erro ao cadastrar '{comp}': {resposta.status_code} - {resposta.text}")
+-
+-print("🎉 Processo finalizado!")
+\ No newline at end of file
